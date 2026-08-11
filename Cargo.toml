@@ -4,6 +4,7 @@ members = [
     "contracts/identity-contract",
     "delegates/whoiam-delegate",
     "toolkit/whoiam-client",
+    "ui",
 ]
 resolver = "2"
 
