@@ -52,6 +52,7 @@ pin-hashes:
 # a wasm-bindgen placeholder import means the getrandom poison is back
 # (freenet/river#241) and the module will not instantiate under wasmtime.
 check-imports:
+	@test -x "$(WASM_TOOLS)" || { echo "wasm-tools not found — cannot verify imports"; exit 1; }
 	@bad=$$($(WASM_TOOLS) print $(W) | grep '(import' | grep -v '"freenet_' || true); \
 	if [ -n "$$bad" ]; then echo "FORBIDDEN IMPORTS in $(W):"; echo "$$bad"; exit 1; fi
 	@echo "$(W): imports clean"

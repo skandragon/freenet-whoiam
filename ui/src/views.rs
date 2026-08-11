@@ -38,6 +38,14 @@ fn published(index: u32) -> Option<whoiam_core::state::IdentityStateV1> {
     IDENTITY_STATES.read().get(&pk.to_bytes())?.clone()
 }
 
+/// Whether the identity's state has actually ARRIVED (vs requested/pending).
+/// "No profile yet" and "state not here yet" must not be conflated: seeding
+/// the edit form from a pending state would let Publish LWW-overwrite the
+/// real profile with blanks.
+fn state_arrived(index: u32) -> bool {
+    published(index).is_some()
+}
+
 fn published_profile(index: u32) -> Option<ProfileV1> {
     let state = published(index)?;
     let slot = state.slots.get(SLOT_PROFILE)?;
@@ -50,7 +58,13 @@ fn published_profile(index: u32) -> Option<ProfileV1> {
 fn published_avatar(index: u32) -> Option<Vec<u8>> {
     let state = published(index)?;
     let slot = state.slots.get(SLOT_AVATAR)?;
-    (!slot.bytes.is_empty()).then(|| slot.bytes.clone())
+    if slot.bytes.is_empty() {
+        return None;
+    }
+    // Signed ≠ well-formed: schema-check before the bytes reach an <img>.
+    whoiam_core::resources::check_avatar_bytes(&slot.bytes)
+        .ok()
+        .map(|_| slot.bytes.clone())
 }
 
 fn avatar_data_url(bytes: &[u8]) -> String {
@@ -114,11 +128,10 @@ async fn shrink_to_avatar(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
         .map_err(|_| "create img")?
         .dyn_into()
         .map_err(|_| "img cast")?;
-    // Browsers sniff the container from the bytes; a generic mime is fine.
+    // Browsers sniff the container from the bytes, so one generic-mime
+    // decode attempt suffices: if it fails, it isn't an image.
     img.set_src(&format!("data:image/png;base64,{}", b64.encode(&bytes)));
     if wasm_bindgen_futures::JsFuture::from(img.decode()).await.is_err() {
-        // Retry as jpeg-ish data; most browsers already sniffed, so a second
-        // failure means it's not an image at all.
         return Err("that file doesn't decode as an image".into());
     }
     let (w, h) = (img.natural_width(), img.natural_height());
@@ -126,8 +139,11 @@ async fn shrink_to_avatar(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
         return Err("empty image".into());
     }
     let side = w.min(h);
-    for out in [512u32, 384, 256, 192, 128, 96, 64] {
-        let out = out.min(side.max(64));
+    // Descend from the schema's max dimension until the PNG fits the byte
+    // cap (photos at 512² routinely exceed it); never below the schema min.
+    use whoiam_core::resources::{MAX_AVATAR_DIM, MIN_AVATAR_DIM};
+    for out in [MAX_AVATAR_DIM, 384, 256, 192, 128, 96, MIN_AVATAR_DIM] {
+        let out = out.min(side.max(MIN_AVATAR_DIM));
         let canvas: web_sys::HtmlCanvasElement = document
             .create_element("canvas")
             .map_err(|_| "create canvas")?
@@ -227,13 +243,14 @@ pub fn App() -> Element {
                         api::log(&format!("{key} get failed: {e}"));
                     }
                 }
-                // Watchdog: a swallowed delegate error means the seed answer
-                // never arrives — flip to an explanatory screen, not an
-                // eternal spinner.
+                // Watchdog: a swallowed delegate error means the seed OR
+                // meta answer never arrives — flip to an explanatory
+                // screen, not an eternal spinner. (Both Gets go out
+                // together; either can be the one the node swallows.)
                 spawn(async {
                     crate::sleep_ms(KEY_STORE_TIMEOUT_MS).await;
-                    if SEED_LOADED.peek().is_none() {
-                        api::log("seed answer never arrived — key store unreachable");
+                    if SEED_LOADED.peek().is_none() || !*META_LOADED.peek() {
+                        api::log("seed/meta answer never arrived — key store unreachable");
                         *KEY_STORE_UNREACHABLE.write() = true;
                     }
                 });
@@ -251,7 +268,10 @@ pub fn App() -> Element {
         }
     });
 
-    let body = if *KEY_STORE_UNREACHABLE.read() && seed().is_none() {
+    // Unreachable wins whenever the boot answers are incomplete — a loaded
+    // seed with swallowed meta must not spin forever on "Loading…".
+    let boot_complete = seed().is_some() && *META_LOADED.read();
+    let body = if *KEY_STORE_UNREACHABLE.read() && !boot_complete {
         rsx! { Unreachable {} }
     } else {
         match SEED_LOADED.read().clone() {
@@ -525,13 +545,16 @@ fn Detail(index: u32) -> Element {
         .map(|e| e.label.clone())
         .unwrap_or_default();
 
+    let arrived = state_arrived(index);
     let profile = published_profile(index);
     let avatar = published_avatar(index);
 
     let mut name = use_signal(String::new);
     let mut bio = use_signal(String::new);
     let mut form_seeded = use_signal(|| false);
-    if !*form_seeded.read() {
+    // Seed the form only once the state has ARRIVED: seeding blank while
+    // the fetch is pending would let Publish LWW-erase the live profile.
+    if arrived && !*form_seeded.read() {
         if let Some(p) = &profile {
             name.set(p.name.clone());
             bio.set(p.bio.clone());
@@ -547,6 +570,17 @@ fn Detail(index: u32) -> Element {
     let mut confirm = use_signal(String::new);
     let mut destroy_busy = use_signal(|| false);
     let mut destroy_err = use_signal(String::new);
+
+    // After every hook (Dioxus hook order must not vary between renders):
+    // wait for the contract state before showing editable surfaces.
+    if !arrived {
+        return rsx! {
+            section { class: "wrap narrow-wrap",
+                button { class: "ghost back", onclick: move |_| *VIEW.write() = View::Home, "← all identities" }
+                Loading { message: "Fetching this identity from the network…" }
+            }
+        };
+    }
 
     let addr = full_key(&pkb);
     let contract_id = crate::keys::identity_key(&pk).id().to_string();

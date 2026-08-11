@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 pub const MAX_SLOT_BYTES: usize = 128 * 1024;
 /// Hard cap on the whole serialized state.
 pub const MAX_STATE_BYTES: usize = 512 * 1024;
-/// Timestamps further than this ahead of the host clock are rejected — a
-/// poisoned far-future timestamp must not win LWW forever.
+/// Timestamps (slot and destruction-marker alike) further than this ahead
+/// of the host clock are rejected — a poisoned far-future timestamp must
+/// not win LWW forever. Enforced in merge.rs.
 pub const MAX_FUTURE_MS: u64 = 10 * 60 * 1000;
 
 const SLOT_DOMAIN: &[u8] = b"whoiam-slot-v1";
@@ -174,6 +175,38 @@ mod tests {
         let b = sign_slot(&sk, "x", 1000, b"b".to_vec());
         assert_ne!(slot_order_key(&a), slot_order_key(&b));
         assert!(slot_order_key(&a) < slot_order_key(&b) || slot_order_key(&b) < slot_order_key(&a));
+    }
+
+    /// Golden vectors: these formats are network-frozen. Every other test
+    /// signs and verifies with the same in-process code, so a format change
+    /// passes them all while invalidating every published state — only a
+    /// pinned known answer catches that. If one of these fails, you have
+    /// broken wire compatibility; that must be a deliberate migration.
+    #[test]
+    fn golden_slot_and_destroy_signatures() {
+        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let slot = sign_slot(&sk, "profile", 12345, b"hello".to_vec());
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&slot.sig.to_bytes()),
+            "a0ca03fe361f24849390499c2f034e9ef1420102ee6fe3df288eac70b6654d767484f0448421f4ffef285a019c653f27625e9f4261849a2a56083c1cf0d2490b",
+        );
+        let m = sign_destroy(&sk, 99999);
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&m.sig.to_bytes()),
+            "59104fe94693ac16e9cc4d69358eb8169eb0f14e21d2c92b3dffa52a944a6edbae7fb727684a2b0c6e0f4c30dc09c5eef2873aeb5e7060e86483212f65265201",
+        );
+    }
+
+    /// Params CBOR is the other half of the contract address (with the
+    /// pinned wasm); an encoding shift here rotates every identity address.
+    #[test]
+    fn golden_params_cbor() {
+        let pk = SigningKey::from_bytes(&[42u8; 32]).verifying_key();
+        let params = IdentityParamsV1 { version: 1, pubkey: pk };
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&crate::to_cbor(&params).unwrap()),
+            "a26776657273696f6e01667075626b65795820197f6b23e16c8532c6abc838facd5ea789be0c76b2920334039bfa8b3d368d61",
+        );
     }
 
     #[test]

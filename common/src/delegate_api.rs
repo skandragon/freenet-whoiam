@@ -30,6 +30,26 @@ pub const KEY_META: &str = "meta";
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct IdentityMeta {
     pub identities: Vec<IdentityEntry>,
+    /// Monotonic allocation watermark. Indices derive keypairs, so a
+    /// destroyed identity's index must NEVER be handed out again (the new
+    /// identity would inherit the destroyed contract). Allocate from here,
+    /// bump on create, never decrement. `default` keeps pre-field stored
+    /// meta decodable; [`IdentityMeta::alloc_index`] covers the 0 it decodes to.
+    #[serde(default)]
+    pub next_index: u32,
+}
+
+impl IdentityMeta {
+    /// Next index to create under. The max-over-live fallback covers meta
+    /// stored before `next_index` existed (deserialized as 0).
+    pub fn alloc_index(&self) -> u32 {
+        self.identities
+            .iter()
+            .map(|e| e.index + 1)
+            .max()
+            .unwrap_or(0)
+            .max(self.next_index)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -60,9 +80,43 @@ mod tests {
                 index: 0,
                 label: "main".into(),
             }],
+            next_index: 1,
         };
         let bytes = crate::to_cbor(&meta).unwrap();
         let back: IdentityMeta = crate::from_cbor(&bytes).unwrap();
         assert_eq!(meta, back);
+    }
+
+    /// A destroyed identity's index must never be reallocated: the watermark
+    /// stays high even after the entry is removed from the live list.
+    #[test]
+    fn alloc_never_reuses_destroyed_index() {
+        let mut meta = IdentityMeta::default();
+        assert_eq!(meta.alloc_index(), 0);
+        meta.identities.push(IdentityEntry { index: 0, label: "a".into() });
+        meta.next_index = 1;
+        meta.identities.push(IdentityEntry { index: 1, label: "b".into() });
+        meta.next_index = 2;
+        // Destroy the highest-index identity.
+        meta.identities.retain(|e| e.index != 1);
+        assert_eq!(meta.alloc_index(), 2, "index 1 must stay retired");
+    }
+
+    /// Meta stored before `next_index` existed must still decode, and
+    /// alloc_index must cover the 0 it decodes to.
+    #[test]
+    fn pre_next_index_meta_decodes() {
+        // Encode the old shape by hand: a map with only `identities`.
+        #[derive(serde::Serialize)]
+        struct OldMeta {
+            identities: Vec<IdentityEntry>,
+        }
+        let old = OldMeta {
+            identities: vec![IdentityEntry { index: 3, label: "x".into() }],
+        };
+        let bytes = crate::to_cbor(&old).unwrap();
+        let meta: IdentityMeta = crate::from_cbor(&bytes).unwrap();
+        assert_eq!(meta.next_index, 0);
+        assert_eq!(meta.alloc_index(), 4);
     }
 }

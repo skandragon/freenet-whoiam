@@ -47,9 +47,16 @@ impl ContractInterface for Contract {
         }
         let state: IdentityStateV1 = deser(bytes, "state")?;
         let params: IdentityParamsV1 = deser(parameters.as_ref(), "parameters")?;
+        if params.version != 1 {
+            return Ok(ValidateResult::Invalid);
+        }
         match validate_full(&state, &params.pubkey, now_ms()) {
             Ok(()) => Ok(ValidateResult::Valid),
-            Err(_) => Ok(ValidateResult::Invalid),
+            // ValidateResult::Invalid carries no reason; log it or it dies here.
+            Err(e) => {
+                freenet_stdlib::log::info(&format!("invalid state: {e}"));
+                Ok(ValidateResult::Invalid)
+            }
         }
     }
 
@@ -59,16 +66,23 @@ impl ContractInterface for Contract {
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
         let params: IdentityParamsV1 = deser(parameters.as_ref(), "parameters")?;
+        if params.version != 1 {
+            return Err(ContractError::InvalidUpdateWithInfo {
+                reason: format!("unsupported params version {}", params.version),
+            });
+        }
         let mut current = parse_state(state.as_ref())?;
         let now = now_ms();
         for update in data {
             // State and delta are the same shape: a (possibly partial)
-            // IdentityStateV1 to fold in.
+            // IdentityStateV1 to fold in. Unknown variants (#[non_exhaustive])
+            // are rejected, not skipped — acknowledging an update we didn't
+            // apply would be a lie (freebird convention, all five contracts).
             let incoming: IdentityStateV1 = match &update {
                 UpdateData::State(s) => parse_state(s.as_ref())?,
                 UpdateData::Delta(d) => parse_state(d.as_ref())?,
                 UpdateData::StateAndDelta { state, .. } => parse_state(state.as_ref())?,
-                _ => continue,
+                _ => return Err(ContractError::InvalidUpdate),
             };
             merge_state(&mut current, &incoming, &params.pubkey, now)
                 .map_err(|e| ContractError::InvalidUpdateWithInfo { reason: e })?;
@@ -106,8 +120,10 @@ mod tests {
     use rand::rngs::OsRng;
     use whoiam_core::state::{sign_destroy, sign_slot};
 
-    // The native freenet_stdlib::time stub sits near epoch zero, so test
-    // timestamps must be small values (always in the past, never far-future).
+    // The native freenet_stdlib::time stub returns an arbitrary value (it
+    // transmutes uninitialized memory — freenet-stdlib 0.8.5 src/time.rs),
+    // so test timestamps must be small: after the `.max(0)` clamp, any
+    // possible clock value accepts them as past, never far-future.
     fn wall_now() -> u64 {
         10_000
     }

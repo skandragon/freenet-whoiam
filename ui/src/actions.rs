@@ -26,26 +26,63 @@ fn signing_key(index: u32) -> Result<SigningKey, String> {
         .ok_or_else(|| "seed not loaded".to_string())
 }
 
-async fn store_meta(meta: &IdentityMeta) -> Result<(), String> {
+/// How long to wait for the delegate's Stored ack. The node answers
+/// delegate requests locally, so honest failures surface fast.
+const KV_ACK_TIMEOUT_MS: u32 = 10_000;
+/// How long to wait for a contract Put/Update confirmation.
+const CONTRACT_ACK_TIMEOUT_MS: u32 = 30_000;
+
+/// Poll until `done()` or timeout. The protocol has no request ids, so
+/// "done" is a caller-chosen observation (an ack counter passing its
+/// pre-send baseline, or state reflecting the write).
+async fn wait_until(mut done: impl FnMut() -> bool, timeout_ms: u32, what: &str) -> Result<(), String> {
+    let mut waited = 0u32;
+    while waited < timeout_ms {
+        if done() {
+            return Ok(());
+        }
+        crate::sleep_ms(100).await;
+        waited += 100;
+    }
+    Err(format!("{what} was not confirmed — nothing was changed remotely. Reload and try again."))
+}
+
+/// Store a delegate value and wait for its Stored ack. Send success only
+/// means the frame left the browser; a swallowed delegate error would
+/// otherwise masquerade as persistence.
+async fn kv_store_confirmed(key: &str, value: Vec<u8>) -> Result<(), String> {
+    let baseline = api::kv_acks(key);
     api::kv_request(WhoiamDelegateRequest::Store {
-        key: KEY_META.into(),
-        value: ByteBuf::from(whoiam_core::to_cbor(meta)?),
+        key: key.into(),
+        value: ByteBuf::from(value),
     })
     .await?;
+    wait_until(
+        || api::kv_acks(key) > baseline,
+        KV_ACK_TIMEOUT_MS,
+        &format!("storing {key:?} in the key store"),
+    )
+    .await
+}
+
+/// Persist meta, then mirror it locally — only after the delegate confirms,
+/// so the UI never shows identities the store doesn't hold.
+async fn store_meta(meta: &IdentityMeta) -> Result<(), String> {
+    kv_store_confirmed(KEY_META, whoiam_core::to_cbor(meta)?).await?;
     *META.write() = meta.clone();
     Ok(())
 }
 
 /// First run: generate the master seed and persist it in the delegate.
+/// SEED_LOADED flips only after the Stored ack — an optimistic write here
+/// would both fake onboarding on a failed store AND disarm the
+/// empty-delegate-response detector (it only fires while the seed is
+/// unloaded).
 pub async fn create_seed() -> Result<(), String> {
     use rand::RngCore;
     let mut s = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut s);
-    api::kv_request(WhoiamDelegateRequest::Store {
-        key: KEY_SEED.into(),
-        value: ByteBuf::from(s.to_vec()),
-    })
-    .await?;
+    kv_store_confirmed(KEY_SEED, s.to_vec()).await?;
     *SEED_LOADED.write() = Some(Some(s));
     store_meta(&IdentityMeta::default()).await
 }
@@ -66,17 +103,22 @@ pub fn parse_backup(input: &str) -> Result<[u8; 32], String> {
     <[u8; 32]>::try_from(&entropy[..len]).map_err(|_| "phrase must encode 32 bytes (24 words)".into())
 }
 
-/// The backup file contents for the current seed.
-pub fn backup_text() -> Result<String, String> {
-    let s = seed().ok_or("seed not loaded")?;
-    let hex = data_encoding::HEXLOWER.encode(&s);
-    let words = bip39::Mnemonic::from_entropy(&s).map_err(|e| e.to_string())?;
+/// The backup file contents for a seed. Pure so the round-trip with
+/// [`parse_backup`] is testable without a browser.
+pub fn backup_text_for(s: &[u8; 32]) -> Result<String, String> {
+    let hex = data_encoding::HEXLOWER.encode(s);
+    let words = bip39::Mnemonic::from_entropy(s).map_err(|e| e.to_string())?;
     Ok(format!(
         "whoiam master seed — KEEP THIS SECRET, KEEP THIS SAFE\n\
          Anyone with this seed controls every identity derived from it,\n\
          including ones you create in the future.\n\n\
          hex:\n{hex}\n\nrecovery phrase (24 words):\n{words}\n"
     ))
+}
+
+/// The backup file contents for the current seed.
+pub fn backup_text() -> Result<String, String> {
+    backup_text_for(&seed().ok_or("seed not loaded")?)
 }
 
 /// Restore: store the seed, then probe derived addresses for existing
@@ -87,16 +129,22 @@ pub fn backup_text() -> Result<String, String> {
 pub async fn restore_seed(input: String) -> Result<(), String> {
     const PROBE_LIMIT: u32 = 16;
     let s = parse_backup(&input)?;
-    api::kv_request(WhoiamDelegateRequest::Store {
-        key: KEY_SEED.into(),
-        value: ByteBuf::from(s.to_vec()),
-    })
-    .await?;
+    kv_store_confirmed(KEY_SEED, s.to_vec()).await?;
     *SEED_LOADED.write() = Some(Some(s));
 
+    let mut send_failures = 0u32;
     for index in 0..PROBE_LIMIT {
         let pk = identity_signing_key(&s, index).verifying_key();
-        let _ = api::fetch_identity(&pk).await;
+        if let Err(e) = api::fetch_identity(&pk).await {
+            api::log(&format!("restore probe {index} failed to send: {e}"));
+            send_failures += 1;
+        }
+    }
+    // Every probe failing to SEND is not "searched and found nothing" —
+    // it's "couldn't search". Empty-meta success here would read as a bad
+    // backup phrase and invite recreating identity 0 over a live one.
+    if send_failures == PROBE_LIMIT {
+        return Err("couldn't reach the network to search for your identities — reload and try again".into());
     }
     crate::sleep_ms(8000).await;
 
@@ -112,6 +160,9 @@ pub async fn restore_seed(input: String) -> Result<(), String> {
                         label: format!("identity {index}"),
                     });
                 }
+                // Destroyed identities stay out of the list but still push
+                // the watermark: their indices are retired forever.
+                meta.next_index = meta.next_index.max(index + 1);
             }
         }
     }
@@ -120,6 +171,7 @@ pub async fn restore_seed(input: String) -> Result<(), String> {
 
 /// Manually re-attach one index restore probing missed (e.g. the contract
 /// rotted off the network). Re-PUTs an empty state to revive the address.
+/// No UI affordance yet — callable surface for the restore-miss case.
 pub async fn readd_index(index: u32) -> Result<(), String> {
     let sk = signing_key(index)?;
     let pk = sk.verifying_key();
@@ -127,38 +179,51 @@ pub async fn readd_index(index: u32) -> Result<(), String> {
     if meta.identities.iter().any(|e| e.index == index) {
         return Err(format!("index {index} is already attached"));
     }
+    let baseline = api::contract_acks(&pk);
     api::put_identity(&pk, &IdentityStateV1::default()).await?;
+    wait_until(
+        || api::contract_acks(&pk) > baseline,
+        CONTRACT_ACK_TIMEOUT_MS,
+        "reviving the identity contract",
+    )
+    .await?;
     meta.identities.push(IdentityEntry {
         index,
         label: format!("identity {index}"),
     });
     meta.identities.sort_by_key(|e| e.index);
+    meta.next_index = meta.next_index.max(index + 1);
     store_meta(&meta).await
 }
 
-/// Create the next identity: derive the next unused index, PUT its (empty)
-/// contract, record it in meta.
+/// Create the next identity: allocate from the monotonic watermark (a
+/// destroyed identity's index must never be reused — the rederived key
+/// would inherit its permanently-destroyed contract), PUT its (empty)
+/// contract, and record it in meta only after the node confirms the Put.
 pub async fn create_identity(label: String) -> Result<u32, String> {
-    let meta = META.read().clone();
-    let index = meta
-        .identities
-        .iter()
-        .map(|e| e.index + 1)
-        .max()
-        .unwrap_or(0);
+    let mut meta = META.read().clone();
+    let index = meta.alloc_index();
     let sk = signing_key(index)?;
     let pk = sk.verifying_key();
+    let baseline = api::contract_acks(&pk);
     api::put_identity(&pk, &IdentityStateV1::default()).await?;
+    wait_until(
+        || api::contract_acks(&pk) > baseline,
+        CONTRACT_ACK_TIMEOUT_MS,
+        "creating the identity contract",
+    )
+    .await?;
+    // Confirmed by the PutResponse — this entry is no longer speculative.
     IDENTITY_STATES
         .write()
         .insert(pk.to_bytes(), Some(IdentityStateV1::default()));
-    let mut meta = meta;
     let label = if label.trim().is_empty() {
         format!("identity {index}")
     } else {
         label.trim().to_string()
     };
     meta.identities.push(IdentityEntry { index, label });
+    meta.next_index = index + 1;
     store_meta(&meta).await?;
     Ok(index)
 }
@@ -174,15 +239,38 @@ pub async fn rename_identity(index: u32, label: String) -> Result<(), String> {
     store_meta(&meta).await
 }
 
-/// Sign one slot and push it; optimistic local apply so the UI updates
-/// immediately (the contract runs the same merge).
+/// Sign one slot, push it, and wait for confirmation: either an
+/// UpdateResponse ack or the subscription echo landing the slot in local
+/// state (dispatch merges notifications for tracked contracts). No
+/// optimistic apply — "published ✓" must mean the node accepted it.
 async fn publish_slot(index: u32, name: &str, bytes: Vec<u8>) -> Result<(), String> {
     let sk = signing_key(index)?;
     let pk = sk.verifying_key();
-    let slot = sign_slot(&sk, name, keys::now_ms(), bytes);
+    let time_ms = keys::now_ms();
+    let slot = sign_slot(&sk, name, time_ms, bytes);
     let mut delta = IdentityStateV1::default();
     delta.slots.insert(name.to_string(), slot);
+    let baseline = api::contract_acks(&pk);
     api::update_identity(&pk, &delta).await?;
+    let slot_name = name.to_string();
+    let pkb = pk.to_bytes();
+    wait_until(
+        move || {
+            if api::contract_acks(&pk) > baseline {
+                return true;
+            }
+            IDENTITY_STATES
+                .peek()
+                .get(&pkb)
+                .and_then(|e| e.as_ref())
+                .and_then(|s| s.slots.get(&slot_name))
+                .is_some_and(|s| s.time_ms >= time_ms)
+        },
+        CONTRACT_ACK_TIMEOUT_MS,
+        "publishing",
+    )
+    .await?;
+    // Confirmed: mirror locally (idempotent if the echo already merged it).
     let mut states = IDENTITY_STATES.write();
     let entry = states.entry(pk.to_bytes()).or_insert(None);
     let current = entry.get_or_insert_with(IdentityStateV1::default);
@@ -208,14 +296,36 @@ pub async fn remove_avatar(index: u32) -> Result<(), String> {
     publish_slot(index, SLOT_AVATAR, vec![]).await
 }
 
-/// Destroy the PUBLIC identity first (signed permanent marker), and only
-/// then forget it locally. The seed stays; the index is never reused.
+/// Destroy the PUBLIC identity first (signed permanent marker), wait until
+/// the node confirms the marker landed, and only then forget it locally —
+/// deleting local metadata on an unconfirmed push would leave the public
+/// identity alive while the user believes it destroyed. The seed stays;
+/// `next_index` (untouched here) retires the index forever.
 pub async fn destroy_identity(index: u32) -> Result<(), String> {
     let sk = signing_key(index)?;
     let pk = sk.verifying_key();
     let mut delta = IdentityStateV1::default();
     delta.destroyed = Some(sign_destroy(&sk, keys::now_ms()));
+    let baseline = api::contract_acks(&pk);
     api::update_identity(&pk, &delta).await?;
+    let pkb = pk.to_bytes();
+    wait_until(
+        move || {
+            if api::contract_acks(&pk) > baseline {
+                return true;
+            }
+            // Subscription echo: the destroyed marker merged into local state.
+            IDENTITY_STATES
+                .peek()
+                .get(&pkb)
+                .and_then(|e| e.as_ref())
+                .is_some_and(|s| s.destroyed.is_some())
+        },
+        CONTRACT_ACK_TIMEOUT_MS,
+        "destroying the public identity",
+    )
+    .await
+    .map_err(|e| format!("{e} The identity was NOT removed locally."))?;
 
     let mut meta = META.read().clone();
     meta.identities.retain(|e| e.index != index);
@@ -226,11 +336,62 @@ pub async fn destroy_identity(index: u32) -> Result<(), String> {
 }
 
 /// Fetch (and subscribe to) every identity in meta — boot and post-restore.
+/// The empty re-PUT first is the freebird resume pattern: it creates the
+/// contract if it's missing (rotted off the network, or orphaned by a
+/// deliberate wasm rotation) and is a merge no-op otherwise, so our own
+/// identities self-heal on every boot.
 pub async fn fetch_all_identities() {
     let entries = META.read().identities.clone();
     for e in entries {
         if let Some(pk) = identity_pubkey(e.index) {
-            let _ = api::fetch_identity(&pk).await;
+            if let Err(err) = api::put_identity(&pk, &IdentityStateV1::default()).await {
+                api::log(&format!("identity {} re-put failed: {err}", e.index));
+            }
+            if let Err(err) = api::fetch_identity(&pk).await {
+                api::log(&format!("identity {} fetch failed: {err}", e.index));
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{backup_text_for, parse_backup};
+
+    const SEED: [u8; 32] = [0x5A; 32];
+
+    /// The whole point of a backup: both encodings in the file must parse
+    /// back to the exact seed. This is the restore path's data-loss guard.
+    #[test]
+    fn backup_round_trips_both_encodings() {
+        let text = backup_text_for(&SEED).unwrap();
+        let hex_line = text.lines().find(|l| l.len() == 64).unwrap();
+        let words_line = text.lines().last().unwrap();
+        assert_eq!(words_line.split_whitespace().count(), 24);
+        assert_eq!(parse_backup(hex_line).unwrap(), SEED);
+        assert_eq!(parse_backup(words_line).unwrap(), SEED);
+    }
+
+    #[test]
+    fn hex_forgiving_of_case_and_whitespace() {
+        let hex = data_encoding::HEXLOWER.encode(&SEED);
+        assert_eq!(parse_backup(&hex.to_uppercase()).unwrap(), SEED);
+        // As pasted from the backup file with a stray newline/indent.
+        assert_eq!(parse_backup(&format!("  {}\n", hex)).unwrap(), SEED);
+        // Whitespace INSIDE the hex (line-wrapped paste).
+        let (a, b) = hex.split_at(32);
+        assert_eq!(parse_backup(&format!("{a}\n{b}")).unwrap(), SEED);
+    }
+
+    #[test]
+    fn wrong_sizes_rejected() {
+        // 12-word phrase = 16-byte entropy: valid BIP39, wrong seed size.
+        let twelve = bip39::Mnemonic::from_entropy(&[7u8; 16]).unwrap().to_string();
+        assert!(parse_backup(&twelve).is_err());
+        // Near-miss hex lengths fall through to the mnemonic parser and fail.
+        let hex = data_encoding::HEXLOWER.encode(&SEED);
+        assert!(parse_backup(&hex[..63]).is_err());
+        assert!(parse_backup(&format!("{hex}0")).is_err());
+        assert!(parse_backup("definitely not a backup").is_err());
     }
 }

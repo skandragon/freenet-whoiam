@@ -102,9 +102,15 @@ fn wall_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Convert verified state into the typed Identity. Pure — unit-tested
-/// without a node.
-pub fn identity_from_state(
+/// Convert verified state into the typed Identity. `pub(crate)` on purpose:
+/// the only public path to an `Identity` is `fetch`, which verifies first —
+/// this function assumes its input already passed `validate_full`.
+///
+/// Well-known slots get their schema enforced here too: signatures prove
+/// authorship, not honesty, and a hostile identity can self-sign anything.
+/// A schema-violating `profile`/`avatar` fails the fetch as Malformed
+/// rather than reaching consumers unchecked.
+pub(crate) fn identity_from_state(
     pk: &VerifyingKey,
     state: &IdentityStateV1,
 ) -> Result<Identity, FetchError> {
@@ -120,9 +126,19 @@ pub fn identity_from_state(
     }
     let profile = raw_slots
         .get(SLOT_PROFILE)
-        .map(|b| whoiam_core::from_cbor::<ProfileV1>(b).map_err(FetchError::Malformed))
+        .map(|b| {
+            let p: ProfileV1 = whoiam_core::from_cbor(b).map_err(FetchError::Malformed)?;
+            whoiam_core::resources::check_profile(&p).map_err(FetchError::Malformed)?;
+            Ok(p)
+        })
         .transpose()?;
-    let avatar = raw_slots.get(SLOT_AVATAR).cloned();
+    let avatar = raw_slots
+        .get(SLOT_AVATAR)
+        .map(|b| {
+            whoiam_core::resources::check_avatar_bytes(b).map_err(FetchError::Malformed)?;
+            Ok(b.clone())
+        })
+        .transpose()?;
     Ok(Identity {
         pubkey: *pk,
         profile,
@@ -156,6 +172,11 @@ pub async fn fetch(node_url: &str, pk: &VerifyingKey) -> Result<Identity, FetchE
                 })) => return Ok(state),
                 Ok(_) => continue,
                 Err(e) => {
+                    // Fragile by necessity: the client error type exposes no
+                    // structured not-found variant, so this string-matches
+                    // the node's wording. A node release rewording the
+                    // message degrades NotFound to Transport (not unsafe,
+                    // just less precise).
                     let msg = e.to_string();
                     return Err(if msg.contains("not found") {
                         FetchError::NotFound
@@ -236,6 +257,37 @@ mod tests {
         assert!(matches!(
             identity_from_state(&pk, &dead),
             Err(FetchError::Destroyed { since_ms: 300 })
+        ));
+    }
+
+    /// Signatures prove authorship, not honesty: schema-violating well-known
+    /// slots from a hostile identity must not reach consumers.
+    #[test]
+    fn hostile_well_known_slots_rejected() {
+        let sk = key();
+        let pk = sk.verifying_key();
+
+        let mut state = IdentityStateV1::default();
+        let big_bio = whoiam_core::to_cbor(&ProfileV1 {
+            name: "x".into(),
+            bio: "b".repeat(100_000),
+        })
+        .unwrap();
+        state
+            .slots
+            .insert("profile".into(), sign_slot(&sk, "profile", 100, big_bio));
+        assert!(matches!(
+            identity_from_state(&pk, &state),
+            Err(FetchError::Malformed(_))
+        ));
+
+        let mut state = IdentityStateV1::default();
+        state
+            .slots
+            .insert("avatar".into(), sign_slot(&sk, "avatar", 100, b"GIF89a not a png".to_vec()));
+        assert!(matches!(
+            identity_from_state(&pk, &state),
+            Err(FetchError::Malformed(_))
         ));
     }
 }

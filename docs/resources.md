@@ -9,7 +9,7 @@ signed — ignore ones you don't understand.
 Verify before trusting: the serving node is untrusted. `whoiam-client`
 (Rust) does full signature verification on fetch; if you decode state by
 hand you must verify each slot's signature yourself (domain-separated
-ed25519, see `whoiam-core/src/state.rs`).
+ed25519, see `common/src/state.rs`).
 
 ## Addressing
 

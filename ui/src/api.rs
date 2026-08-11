@@ -262,7 +262,9 @@ fn dispatch(response: HostResponse) {
 
 /// An empty delegate response is the node's tell for a swallowed delegate
 /// error. Exactly one empty response is legitimate — the RegisterDelegate
-/// ack — so only a SECOND one proves errors are being swallowed.
+/// ack — so only a SECOND one proves errors are being swallowed. (Observed
+/// against the freenet1 explorer node, 2026-08-11; a node release changing
+/// the RegisterDelegate ack shape invalidates this count.)
 fn note_empty_delegate_response() {
     use std::sync::atomic::{AtomicU32, Ordering};
     static EMPTY: AtomicU32 = AtomicU32::new(0);
@@ -284,17 +286,54 @@ fn dispatch_contract(response: ContractResponse) {
             UpdateData::StateAndDelta { state, .. } => apply_contract_bytes(&key, state.as_ref()),
             _ => {}
         },
+        // Write confirmations: actions wait on these counters before
+        // reporting success or (for destroy) dropping local key metadata —
+        // `send()` resolving only means the frame left the browser.
+        ContractResponse::PutResponse { key } => bump_contract_ack(&key),
+        ContractResponse::UpdateResponse { key, .. } => bump_contract_ack(&key),
         _ => {}
     }
+}
+
+/// Confirmed writes per contract id: incremented on PutResponse and
+/// UpdateResponse. Uncorrelated with individual requests (the protocol has
+/// no request ids), so waiters compare against a pre-send baseline.
+pub static CONTRACT_ACKS: GlobalSignal<BTreeMap<String, u64>> = Signal::global(BTreeMap::new);
+
+/// Confirmed delegate stores per key, from the delegate's Stored acks.
+pub static KV_ACKS: GlobalSignal<BTreeMap<String, u64>> = Signal::global(BTreeMap::new);
+
+fn bump_contract_ack(key: &ContractKey) {
+    *CONTRACT_ACKS.write().entry(key.id().to_string()).or_insert(0) += 1;
+}
+
+pub fn contract_acks(pk: &VerifyingKey) -> u64 {
+    CONTRACT_ACKS
+        .peek()
+        .get(&keys::identity_key(pk).id().to_string())
+        .copied()
+        .unwrap_or(0)
+}
+
+pub fn kv_acks(key: &str) -> u64 {
+    KV_ACKS.peek().get(key).copied().unwrap_or(0)
 }
 
 /// Full state and deltas are the same shape (a partial IdentityStateV1):
 /// verify against the tracked identity's key, then LWW-merge into place.
 fn apply_contract_bytes(key: &ContractKey, bytes: &[u8]) {
+    let Some(owner) = lookup(key) else { return };
     if bytes.is_empty() {
+        // An empty GetResponse is a real answer — contract exists, nothing
+        // published. Mark it arrived (Some(default)) so views stop gating;
+        // "pending" and "empty" must stay distinguishable.
+        IDENTITY_STATES
+            .write()
+            .entry(owner)
+            .or_insert(None)
+            .get_or_insert_with(IdentityStateV1::default);
         return;
     }
-    let Some(owner) = lookup(key) else { return };
     let Ok(vk) = VerifyingKey::from_bytes(&owner) else { return };
     match whoiam_core::from_cbor::<IdentityStateV1>(bytes) {
         Ok(incoming) => {
@@ -314,22 +353,44 @@ fn apply_contract_bytes(key: &ContractKey, bytes: &[u8]) {
 fn dispatch_kv(payload: &[u8]) {
     match whoiam_core::from_cbor::<WhoiamDelegateResponse>(payload) {
         Ok(WhoiamDelegateResponse::Value { key, value }) => {
+            // Present-but-undecodable is NOT "absent": treating a corrupt
+            // seed/meta as a fresh install would route to onboarding, whose
+            // next write overwrites possibly-recoverable key material. Flag
+            // unreachable instead so the user gets the error screen.
             if key == KEY_SEED {
-                let seed = value
-                    .as_deref()
-                    .and_then(|v| <[u8; 32]>::try_from(v.as_ref() as &[u8]).ok());
-                *SEED_LOADED.write() = Some(seed);
+                match value.as_deref() {
+                    None => *SEED_LOADED.write() = Some(None),
+                    Some(v) => match <[u8; 32]>::try_from(v.as_ref() as &[u8]) {
+                        Ok(seed) => *SEED_LOADED.write() = Some(Some(seed)),
+                        Err(_) => {
+                            log("stored seed has wrong length — refusing to treat as absent");
+                            *KEY_STORE_UNREACHABLE.write() = true;
+                        }
+                    },
+                }
             } else if key == KEY_META {
-                let meta = value
-                    .as_deref()
-                    .and_then(|v| whoiam_core::from_cbor::<IdentityMeta>(v).ok())
-                    .unwrap_or_default();
-                *META.write() = meta;
-                *META_LOADED.write() = true;
+                match value.as_deref() {
+                    None => {
+                        *META.write() = IdentityMeta::default();
+                        *META_LOADED.write() = true;
+                    }
+                    Some(v) => match whoiam_core::from_cbor::<IdentityMeta>(v) {
+                        Ok(meta) => {
+                            *META.write() = meta;
+                            *META_LOADED.write() = true;
+                        }
+                        Err(e) => {
+                            log(&format!("stored meta undecodable ({e}) — refusing to treat as empty"));
+                            *KEY_STORE_UNREACHABLE.write() = true;
+                        }
+                    },
+                }
             }
         }
-        Ok(WhoiamDelegateResponse::Stored { .. })
-        | Ok(WhoiamDelegateResponse::Deleted { .. })
+        Ok(WhoiamDelegateResponse::Stored { key }) => {
+            *KV_ACKS.write().entry(key).or_insert(0) += 1;
+        }
+        Ok(WhoiamDelegateResponse::Deleted { .. })
         | Ok(WhoiamDelegateResponse::KeyList { .. }) => {}
         Ok(WhoiamDelegateResponse::Error { message }) => {
             log(&format!("delegate error: {message}"));

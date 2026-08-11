@@ -25,6 +25,21 @@ mod tests {
         );
     }
 
+    /// Golden vector: derivation is the backup format — a change here means
+    /// every user's seed stops restoring their identities, and the
+    /// `deterministic` test above cannot catch it (both sides change
+    /// together). Failing this is breaking every backup in existence.
+    #[test]
+    fn golden_derivation() {
+        let seed = [7u8; 32];
+        let hex = |i: u32| {
+            data_encoding::HEXLOWER
+                .encode(identity_signing_key(&seed, i).verifying_key().as_bytes())
+        };
+        assert_eq!(hex(0), "2a76f1666f3aac4f859a1f35300050b69275202d3b880d9f165083c92818b0b5");
+        assert_eq!(hex(1), "e62a914becffd666c412644071c11b1787347bf1c1b7c77a2cc5997921a673eb");
+    }
+
     #[test]
     fn distinct_per_index_and_seed() {
         let seed = [7u8; 32];

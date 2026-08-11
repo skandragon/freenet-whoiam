@@ -39,6 +39,9 @@ pub fn validate_full(
 ) -> Result<(), String> {
     if let Some(m) = &state.destroyed {
         check_destroy(m, pk)?;
+        if m.time_ms > now_ms.saturating_add(MAX_FUTURE_MS) {
+            return Err("destruction marker timestamp too far in the future".into());
+        }
         if !state.slots.is_empty() {
             return Err("destroyed state must carry no slots".into());
         }
@@ -54,7 +57,9 @@ pub fn validate_full(
 }
 
 /// Fold `incoming` into `current`. Returns Ok(true) if `current` changed.
-/// Anything invalid in `incoming` rejects the whole update.
+/// Anything invalid in `incoming` rejects the whole update, and on Err
+/// `current` is left untouched (the UI merges into live signal state, so
+/// partial application would leak).
 pub fn merge_state(
     current: &mut IdentityStateV1,
     incoming: &IdentityStateV1,
@@ -62,8 +67,16 @@ pub fn merge_state(
     now_ms: u64,
 ) -> Result<bool, String> {
     // A destruction marker anywhere ends the identity: verify, then collapse.
+    // The far-future clamp applies here too — a poisoned destroyed_ms would
+    // otherwise flow out to consumers via FetchError::Destroyed.
     if let Some(m) = &incoming.destroyed {
         check_destroy(m, pk)?;
+        if m.time_ms > now_ms.saturating_add(MAX_FUTURE_MS) {
+            return Err("destruction marker timestamp too far in the future".into());
+        }
+        // Newest-marker compare needs no hash tie-break: dalek ed25519
+        // signing is deterministic, so two markers for the same (key, time)
+        // are byte-identical and converge trivially.
         match &current.destroyed {
             Some(held) if held.time_ms >= m.time_ms => return Ok(false),
             _ => {
@@ -82,20 +95,26 @@ pub fn merge_state(
         };
     }
 
+    // Merge into a scratch copy so an Err mid-loop can't leave a partial
+    // merge behind.
+    let mut result = current.clone();
     let mut changed = false;
     for (name, slot) in &incoming.slots {
         check_incoming_slot(name, slot, pk, now_ms)?;
-        let newer = current
+        let newer = result
             .slots
             .get(name)
             .is_none_or(|held| slot_order_key(slot) > slot_order_key(held));
         if newer {
-            current.slots.insert(name.clone(), slot.clone());
+            result.slots.insert(name.clone(), slot.clone());
             changed = true;
         }
     }
-    if changed && crate::to_cbor(current)?.len() > MAX_STATE_BYTES {
-        return Err(format!("merged state exceeds {MAX_STATE_BYTES} bytes"));
+    if changed {
+        if crate::to_cbor(&result)?.len() > MAX_STATE_BYTES {
+            return Err(format!("merged state exceeds {MAX_STATE_BYTES} bytes"));
+        }
+        *current = result;
     }
     Ok(changed)
 }
@@ -112,7 +131,8 @@ pub fn summarize(state: &IdentityStateV1) -> SummaryV1 {
 }
 
 /// Everything the summary's holder is missing: slots newer than (or absent
-/// from) the summary, and the destroy marker if they lack it.
+/// from) the summary. A destroyed state always returns whole (marker only —
+/// it's tiny, and the holder's merge collapses to it regardless).
 pub fn delta_since(state: &IdentityStateV1, summary: &SummaryV1) -> IdentityStateV1 {
     if state.destroyed.is_some() {
         return state.clone();
@@ -243,6 +263,51 @@ mod tests {
         let inc = state_with(&sk, "avatar", 200, b"");
         assert!(merge_state(&mut cur, &inc, &pk, NOW).unwrap());
         assert!(cur.slots["avatar"].bytes.is_empty());
+    }
+
+    #[test]
+    fn far_future_destroy_rejected() {
+        let sk = key();
+        let pk = sk.verifying_key();
+        let mut cur = state_with(&sk, "profile", 100, b"x");
+        let mut inc = IdentityStateV1::default();
+        inc.destroyed = Some(sign_destroy(&sk, NOW + MAX_FUTURE_MS + 1));
+        assert!(merge_state(&mut cur, &inc, &pk, NOW).is_err());
+        assert!(cur.destroyed.is_none());
+    }
+
+    #[test]
+    fn err_leaves_current_untouched() {
+        let sk = key();
+        let pk = sk.verifying_key();
+        let mut cur = state_with(&sk, "a", 100, b"old");
+        let before = cur.clone();
+        // Valid new slot "a" plus an invalid (forged) slot "z": the whole
+        // update must reject with no partial application.
+        let mut inc = state_with(&sk, "a", 200, b"new");
+        let mut forged = sign_slot(&sk, "z", 200, b"x".to_vec());
+        forged.bytes = b"forged".to_vec();
+        inc.slots.insert("z".into(), forged);
+        assert!(merge_state(&mut cur, &inc, &pk, NOW).is_err());
+        assert_eq!(cur, before);
+    }
+
+    #[test]
+    fn merged_state_size_cap_enforced() {
+        use crate::state::{MAX_SLOT_BYTES, MAX_STATE_BYTES};
+        let sk = key();
+        let pk = sk.verifying_key();
+        let mut cur = IdentityStateV1::default();
+        // Five near-cap slots serialize past MAX_STATE_BYTES.
+        assert!(5 * MAX_SLOT_BYTES > MAX_STATE_BYTES);
+        let mut inc = IdentityStateV1::default();
+        for i in 0..5 {
+            let name = format!("slot{i}");
+            inc.slots
+                .insert(name.clone(), sign_slot(&sk, &name, 100, vec![7u8; MAX_SLOT_BYTES]));
+        }
+        assert!(merge_state(&mut cur, &inc, &pk, NOW).is_err());
+        assert!(cur.slots.is_empty(), "err must leave current untouched");
     }
 
     #[test]
