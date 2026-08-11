@@ -1,0 +1,2 @@
+95fe8b309d5e33582225271747677249e534070dbc81b3d05dac13baebab5c14  ui/contracts/identity_contract.wasm
+5e38c574d8ea9a21f3ce28d127e1c1f73fed20838fe0f57c8ae2adbfff926189  ui/contracts/whoiam_delegate.wasm
