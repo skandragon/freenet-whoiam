@@ -1,0 +1,49 @@
+[package]
+name = "whoiam-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "whoiam web UI (Dioxus)"
+
+[dependencies]
+whoiam-core.workspace = true
+freenet-stdlib = { workspace = true, features = ["net"] }
+ciborium.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+bs58.workspace = true
+base64 = "0.22"
+data-encoding.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand.workspace = true
+bip39 = "2.1"
+# Browser build: the js backend is fine here (and only here) — the UI runs
+# in a real browser, not wasmtime. See freenet/river#241.
+getrandom = { workspace = true, features = ["js"] }
+
+dioxus = { version = "0.7", features = ["web"] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+futures = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "Location",
+    "Storage",
+    "UrlSearchParams",
+    "WebSocket",
+    "MessageEvent",
+    "console",
+    "Navigator",
+    "Clipboard",
+    "HtmlImageElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "HtmlAnchorElement",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+] }
