@@ -15,6 +15,8 @@ export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
 KEY_NAME="${WHOIAM_SITE_KEY:-whoiam}"
 SITE_DIR="target/dx/whoiam-ui/release/web/public"
 
+# dx leaves stale hashed bundles behind; a dirty dir publishes them all.
+rm -rf "$SITE_DIR"
 make ui
 
 if ! nc -z localhost 7509 2>/dev/null; then
@@ -23,8 +25,9 @@ if ! nc -z localhost 7509 2>/dev/null; then
     exit 1
 fi
 
-# No grep -q: its early exit SIGPIPEs fdev, which pipefail turns into a miss.
-if fdev website list 2>/dev/null | grep "\b${KEY_NAME}\b" >/dev/null; then
+# Exact first-field match: \b-style grep also matches other keys that merely
+# START with this name (whoiam-e2e), routing a first publish to `update`.
+if fdev website list 2>/dev/null | awk -v k="$KEY_NAME" '$1 == k { found = 1 } END { exit !found }'; then
     fdev website update --key "$KEY_NAME" "$SITE_DIR"
 else
     # Local Ed25519 keygen only; the key lives in fdev's store — back it up,

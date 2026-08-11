@@ -5,6 +5,7 @@ members = [
     "delegates/whoiam-delegate",
     "toolkit/whoiam-client",
     "ui",
+    "demo",
 ]
 resolver = "2"
 

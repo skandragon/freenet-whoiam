@@ -123,7 +123,7 @@ pub fn backup_text_for(s: &[u8; 32]) -> Result<String, String> {
     let words = bip39::Mnemonic::from_entropy(s).map_err(|e| e.to_string())?;
     Ok(format!(
         "whoiam master seed — KEEP THIS SECRET, KEEP THIS SAFE\n\
-         Anyone with this seed controls every identity derived from it,\n\
+         Anyone with this seed controls every persona derived from it,\n\
          including ones you create in the future.\n\n\
          hex:\n{hex}\n\nrecovery phrase (24 words):\n{words}\n"
     ))
@@ -157,7 +157,7 @@ pub async fn restore_seed(input: String) -> Result<(), String> {
     // it's "couldn't search". Empty-meta success here would read as a bad
     // backup phrase and invite recreating identity 0 over a live one.
     if send_failures == PROBE_LIMIT {
-        return Err("couldn't reach the network to search for your identities — reload and try again".into());
+        return Err("couldn't reach the network to search for your personas — reload and try again".into());
     }
     crate::sleep_ms(8000).await;
 
@@ -170,7 +170,7 @@ pub async fn restore_seed(input: String) -> Result<(), String> {
                 if state.destroyed.is_none() {
                     meta.identities.push(IdentityEntry {
                         index,
-                        label: format!("identity {index}"),
+                        label: format!("persona {index}"),
                     });
                 }
                 // Destroyed identities stay out of the list but still push
@@ -192,10 +192,10 @@ pub async fn readd_index(index: u32) -> Result<(), String> {
     if meta.identities.iter().any(|e| e.index == index) {
         return Err(format!("index {index} is already attached"));
     }
-    put_identity_confirmed(&pk, "reviving the identity contract").await?;
+    put_identity_confirmed(&pk, "reviving the persona contract").await?;
     meta.identities.push(IdentityEntry {
         index,
-        label: format!("identity {index}"),
+        label: format!("persona {index}"),
     });
     meta.identities.sort_by_key(|e| e.index);
     meta.next_index = meta.next_index.max(index + 1);
@@ -211,13 +211,13 @@ pub async fn create_identity(label: String) -> Result<u32, String> {
     let index = meta.alloc_index();
     let sk = signing_key(index)?;
     let pk = sk.verifying_key();
-    put_identity_confirmed(&pk, "creating the identity contract").await?;
+    put_identity_confirmed(&pk, "creating the persona contract").await?;
     // Confirmed by the PutResponse — this entry is no longer speculative.
     IDENTITY_STATES
         .write()
         .insert(pk.to_bytes(), Some(IdentityStateV1::default()));
     let label = if label.trim().is_empty() {
-        format!("identity {index}")
+        format!("persona {index}")
     } else {
         label.trim().to_string()
     };
@@ -233,7 +233,7 @@ pub async fn rename_identity(index: u32, label: String) -> Result<(), String> {
         .identities
         .iter_mut()
         .find(|e| e.index == index)
-        .ok_or("no such identity")?;
+        .ok_or("no such persona")?;
     entry.label = label.trim().to_string();
     store_meta(&meta).await
 }
@@ -321,10 +321,10 @@ pub async fn destroy_identity(index: u32) -> Result<(), String> {
                 .is_some_and(|s| s.destroyed.is_some())
         },
         CONTRACT_ACK_TIMEOUT_MS,
-        "destroying the public identity",
+        "destroying the public persona",
     )
     .await
-    .map_err(|e| format!("{e} The identity was NOT removed locally."))?;
+    .map_err(|e| format!("{e} The persona was NOT removed locally."))?;
 
     let mut meta = META.read().clone();
     meta.identities.retain(|e| e.index != index);
@@ -332,6 +332,41 @@ pub async fn destroy_identity(index: u32) -> Result<(), String> {
     IDENTITY_STATES.write().remove(&pk.to_bytes());
     *VIEW.write() = View::Home;
     Ok(())
+}
+
+/// Connect challenge charset: URL-safe unreserved chars only, so callback
+/// URLs build by plain concatenation with no re-encoding step to get wrong.
+pub fn valid_challenge(c: &str) -> bool {
+    (1..=256).contains(&c.len())
+        && c.chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '~' | '-'))
+}
+
+fn callback_url(return_url: &str, params: &str) -> String {
+    let sep = if return_url.contains('?') { '&' } else { '?' };
+    format!("{return_url}{sep}{params}")
+}
+
+/// The signed approval callback URL: proof that this persona's key consented
+/// to identify to `req.origin` for this challenge, at this time.
+pub fn connect_ok_url(index: u32, req: &ConnectRequest, time_ms: u64) -> Result<String, String> {
+    let sk = signing_key(index)?;
+    let pk = sk.verifying_key();
+    let sig = whoiam_core::connect::sign_connect(&sk, &req.return_base, &req.challenge, time_ms);
+    let hex = |b: &[u8]| data_encoding::HEXLOWER.encode(b);
+    Ok(callback_url(
+        &req.return_url,
+        &format!(
+            "whoiam=ok&pk={}&sig={}&challenge={}&ts={time_ms}",
+            hex(pk.as_bytes()),
+            hex(&sig.to_bytes()),
+            req.challenge
+        ),
+    ))
+}
+
+pub fn connect_denied_url(req: &ConnectRequest) -> String {
+    callback_url(&req.return_url, "whoiam=denied")
 }
 
 /// Fetch (and subscribe to) every identity in meta — boot and post-restore.
@@ -355,9 +390,26 @@ pub async fn fetch_all_identities() {
 
 #[cfg(test)]
 mod tests {
-    use super::{backup_text_for, parse_backup};
+    use super::{backup_text_for, callback_url, parse_backup, valid_challenge};
 
     const SEED: [u8; 32] = [0x5A; 32];
+
+    #[test]
+    fn challenge_charset_enforced() {
+        assert!(valid_challenge("abc123._~-"));
+        assert!(!valid_challenge(""));
+        assert!(!valid_challenge(&"x".repeat(257)));
+        // Anything that could break URL concatenation or smuggle params.
+        for bad in ["a&b", "a=b", "a b", "a#b", "a%41", "a/b", "ü"] {
+            assert!(!valid_challenge(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn callback_url_separator() {
+        assert_eq!(callback_url("https://x.com/cb", "whoiam=denied"), "https://x.com/cb?whoiam=denied");
+        assert_eq!(callback_url("https://x.com/cb?a=1", "whoiam=denied"), "https://x.com/cb?a=1&whoiam=denied");
+    }
 
     /// The whole point of a backup: both encodings in the file must parse
     /// back to the exact seed. This is the restore path's data-loss guard.

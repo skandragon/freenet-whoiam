@@ -94,6 +94,7 @@ footer.foot {
   padding: 24px 0 32px;
 }
 footer.foot a { color: var(--muted); }
+footer.foot button { background: none; border: none; padding: 0; font: inherit; color: var(--muted); text-decoration: underline; cursor: pointer; }
 
 /* ---- layout blocks ---- */
 
@@ -186,6 +187,7 @@ button.card:hover { transform: translateY(-2px); border-color: rgba(124, 108, 25
 
 .backup { flex-direction: row; align-items: center; justify-content: space-between; gap: 18px; flex-wrap: wrap; }
 .backup > div:first-child { flex: 1 1 340px; }
+.backup .backup-text { flex: 1 1 100%; font-family: ui-monospace, monospace; white-space: pre; }
 
 /* ---- forms & controls ---- */
 
@@ -228,6 +230,7 @@ button:disabled { opacity: 0.55; cursor: default; }
   padding: 9px 16px;
 }
 .ghost:hover:not(:disabled) { border-color: var(--accent-a); }
+label.ghost { font-size: inherit; color: var(--text); margin: 0; border-radius: 10px; cursor: pointer; }
 .ghost.back { align-self: flex-start; border: none; color: var(--muted); padding: 4px 0; }
 .ghost.back:hover { color: var(--text); }
 
@@ -241,6 +244,8 @@ button:disabled { opacity: 0.55; cursor: default; }
 .destructive:hover:not(:disabled) { background: var(--danger); color: #fff; }
 
 .card.danger { border-color: rgba(255, 84, 104, 0.35); }
+summary { cursor: pointer; }
+summary h3 { display: inline; }
 
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 

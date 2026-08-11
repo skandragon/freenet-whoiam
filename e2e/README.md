@@ -8,8 +8,13 @@ identities in that node's delegate store.
 cd e2e
 npm install
 npx playwright install chromium
-WHOIAM_URL="http://127.0.0.1:50509/v1/contract/web/<site-key>/" npm test
+WHOIAM_URL="http://127.0.0.1:50509/v1/contract/web/<site-key>/" \
+WHOIAM_DEMO_URL="http://127.0.0.1:50509/v1/contract/web/<demo-key>/" \
+npm test
 ```
+
+`WHOIAM_DEMO_URL` is the connect-demo app (`scripts/publish-demo.sh`)
+published to the same test node; the connect suite needs it.
 
 Getting a test node + site:
 
