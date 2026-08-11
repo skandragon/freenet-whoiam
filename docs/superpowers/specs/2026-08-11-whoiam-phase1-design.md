@@ -33,9 +33,11 @@ incident: any wasm byte change rotates every derived address).
 
 - Master seed: 32 random bytes, generated in the UI, stored only in the
   delegate.
-- Identity *i* keypair: ed25519 seed = HKDF-SHA256(ikm = master seed,
-  info = `"whoiam-identity"` ‖ u32 index). Identities share no public
-  linkage; derivation is invisible without the seed.
+- Identity *i* keypair: ed25519 seed =
+  `blake3::derive_key("whoiam identity v1", master seed ‖ index_le32)`.
+  (Amended from HKDF-SHA256: same KDF properties, blake3 already a dep.)
+  Identities share no public linkage; derivation is invisible without the
+  seed.
 - Delegate stores: the seed, plus a metadata record (used indices, labels).
   The UI pulls the seed into memory to derive and sign; it never persists it
   outside the delegate.
