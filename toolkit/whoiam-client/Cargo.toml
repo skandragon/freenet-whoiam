@@ -1,0 +1,22 @@
+[package]
+name = "whoiam-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Fetch whoiam identities (avatar, profile) from Freenet, verified client-side"
+
+[dependencies]
+whoiam-core.workspace = true
+freenet-stdlib = { workspace = true, features = ["net"] }
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+bs58.workspace = true
+data-encoding.workspace = true
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros", "time", "net"] }
+tokio-tungstenite = "0.27"
+
+[dev-dependencies]
+rand.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
