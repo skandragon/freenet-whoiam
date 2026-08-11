@@ -14,9 +14,9 @@ export PATH := $(RUSTUP_BIN):$(HOME)/.cargo/bin:$(PATH)
 WASM_TARGET := wasm32-unknown-unknown
 WASM_DIR := target/$(WASM_TARGET)/release
 
-.PHONY: all contracts delegate ui test check-imports check-addresses pin-hashes publish clean
+.PHONY: all contracts delegate ui demo test check-imports check-addresses pin-hashes publish publish-demo clean
 
-all: test contracts delegate ui
+all: test contracts delegate ui demo
 
 contracts:
 	$(CARGO) build -p identity-contract --target $(WASM_TARGET) --release
@@ -66,11 +66,18 @@ ui:
 	$(MAKE) check-addresses
 	cd ui && $(DX) build --release
 
+demo:
+	$(MAKE) check-addresses
+	cd demo && $(DX) build --release
+
 test:
 	$(CARGO) test --workspace
 
 publish:
 	scripts/publish-ui.sh
+
+publish-demo:
+	scripts/publish-demo.sh
 
 clean:
 	$(CARGO) clean

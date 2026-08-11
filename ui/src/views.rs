@@ -67,6 +67,135 @@ fn avatar_data_url(bytes: &[u8]) -> String {
     )
 }
 
+/// Parse a `?connect=v1&challenge=…&return=…` bounce-through request from
+/// the iframe URL (the shell forwards external query params through).
+/// Trust boundary: a malformed request is logged and ignored — the app just
+/// boots normally.
+#[cfg(target_arch = "wasm32")]
+fn connect_request_from_location() -> Option<ConnectRequest> {
+    let search = web_sys::window()?.location().search().ok()?;
+    let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
+    if params.get("connect")? != "v1" {
+        api::log("connect request ignored: unknown version");
+        return None;
+    }
+    let challenge = params.get("challenge")?;
+    let return_url = params.get("return")?;
+    if !actions::valid_challenge(&challenge) {
+        api::log("connect request ignored: bad challenge");
+        return None;
+    }
+    // Absolute http(s) URL, no fragment (a fragment would swallow the
+    // params we append).
+    let Ok(url) = web_sys::Url::new(&return_url) else {
+        api::log("connect request ignored: unparseable return URL");
+        return None;
+    };
+    if !matches!(url.protocol().as_str(), "http:" | "https:") || !url.hash().is_empty() {
+        api::log("connect request ignored: return URL must be http(s) with no fragment");
+        return None;
+    }
+    Some(ConnectRequest {
+        origin: url.origin(),
+        return_base: format!("{}{}", url.origin(), url.pathname()),
+        return_url,
+        challenge,
+    })
+}
+
+/// Mirrors the shell bridge's CONTRACT_PREFIX_RE: `/^\/v[12]\/contract\/web\/[^/]+\//`
+/// — the only shape its `navigate` handler will top-navigate to.
+fn is_contract_web_path(path: &str) -> bool {
+    ["/v1/contract/web/", "/v2/contract/web/"]
+        .iter()
+        .filter_map(|p| path.strip_prefix(p))
+        .any(|rest| rest.find('/').is_some_and(|i| i > 0))
+}
+
+/// Leave the app for `url`, staying in this tab when possible. The sandbox
+/// has no allow-top-navigation, but the shell's `navigate` postMessage
+/// bridge top-navigates on our behalf — it only accepts same-node
+/// contract-app URLs, so anything else still goes out via a popup (which
+/// escapes the sandbox). Returns true if navigation happens in this tab.
+#[cfg(target_arch = "wasm32")]
+fn leave_to(url: &str) -> Result<bool, String> {
+    let win = web_sys::window().ok_or("no window")?;
+    // location.origin is "null" in the opaque-origin sandbox; take our real
+    // origin from href instead.
+    let href = win.location().href().map_err(|_| "no href")?;
+    let own = web_sys::Url::new(&href).map_err(|_| "bad href")?;
+    let target = web_sys::Url::new_with_base(url, &href).map_err(|_| "bad URL")?;
+    if target.origin() != own.origin() || !is_contract_web_path(&target.pathname()) {
+        return open_tab(url).map(|()| false);
+    }
+    if own.search_params().get("__sandbox").is_none() {
+        // Not wrapped by the shell (dev serve): navigate directly.
+        return win
+            .location()
+            .assign(url)
+            .map(|()| true)
+            .map_err(|_| "navigation failed".into());
+    }
+    // ponytail: assumes the node's shell has the navigate bridge (current
+    // freenet-core); an older shell silently drops the message. Add a
+    // timeout fallback to open_tab if old nodes matter.
+    let parent = win
+        .parent()
+        .ok()
+        .flatten()
+        .ok_or("sandboxed but no parent frame")?;
+    let msg = js_sys::Object::new();
+    for (k, v) in [
+        ("__freenet_shell__", wasm_bindgen::JsValue::TRUE),
+        ("type", "navigate".into()),
+        ("href", url.into()),
+    ] {
+        js_sys::Reflect::set(&msg, &k.into(), &v).map_err(|_| "message build failed")?;
+    }
+    parent
+        .post_message(&msg, "*")
+        .map_err(|_| "shell bridge unreachable")?;
+    Ok(true)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn leave_to(_url: &str) -> Result<bool, String> {
+    Err("unavailable".into())
+}
+
+#[cfg(test)]
+mod leave_tests {
+    #[test]
+    fn contract_web_path_shape() {
+        for ok in ["/v1/contract/web/KEY/", "/v2/contract/web/KEY/index.html"] {
+            assert!(super::is_contract_web_path(ok), "{ok}");
+        }
+        for bad in ["/v1/contract/web/KEY", "/v1/contract/web//x", "/v1/node/KEY/", "/v3/contract/web/KEY/"] {
+            assert!(!super::is_contract_web_path(bad), "{bad}");
+        }
+    }
+}
+
+/// New-tab fallback for callbacks the shell won't navigate to (foreign
+/// origins) — a popup escapes the sandbox.
+#[cfg(target_arch = "wasm32")]
+fn open_tab(url: &str) -> Result<(), String> {
+    // `noopener` makes window.open return null even on success, so a None
+    // here is NOT a popup-blocker signal — only a thrown error is.
+    match web_sys::window()
+        .ok_or("no window")?
+        .open_with_url_and_target_and_features(url, "_blank", "noopener,noreferrer")
+    {
+        Ok(_) => Ok(()),
+        Err(_) => Err("couldn't open the return tab — is a popup blocker interfering?".into()),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_tab(_url: &str) -> Result<(), String> {
+    Err("unavailable".into())
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn copy_to_clipboard(text: String) -> Result<(), String> {
     let nav = web_sys::window().ok_or("no window")?.navigator();
@@ -177,37 +306,6 @@ async fn shrink_to_avatar(_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     Err("image processing unavailable".into())
 }
 
-/// Save `text` as a downloaded file.
-#[cfg(target_arch = "wasm32")]
-fn download_text(filename: &str, text: &str) -> Result<(), String> {
-    use wasm_bindgen::JsCast;
-    let document = web_sys::window()
-        .and_then(|w| w.document())
-        .ok_or("no document")?;
-    let array = js_sys::Array::new();
-    array.push(&wasm_bindgen::JsValue::from_str(text));
-    let opts = web_sys::BlobPropertyBag::new();
-    opts.set_type("text/plain");
-    let blob = web_sys::Blob::new_with_str_sequence_and_options(&array, &opts)
-        .map_err(|_| "blob create failed")?;
-    let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(|_| "object url failed")?;
-    let a: web_sys::HtmlAnchorElement = document
-        .create_element("a")
-        .map_err(|_| "create anchor")?
-        .dyn_into()
-        .map_err(|_| "anchor cast")?;
-    a.set_href(&url);
-    a.set_download(filename);
-    a.click();
-    let _ = web_sys::Url::revoke_object_url(&url);
-    Ok(())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn download_text(_filename: &str, _text: &str) -> Result<(), String> {
-    Err("download unavailable".into())
-}
-
 // ---- screens ----
 
 pub fn App() -> Element {
@@ -215,6 +313,9 @@ pub fn App() -> Element {
         spawn(async {
             #[cfg(target_arch = "wasm32")]
             {
+                if let Some(req) = connect_request_from_location() {
+                    *CONNECT.write() = Some(req);
+                }
                 if let Err(e) = api::connect().await {
                     *SYNC_STATUS.write() = SyncStatus::Error(e);
                     return;
@@ -249,7 +350,7 @@ pub fn App() -> Element {
         });
     });
 
-    // Once the seed and meta are both in, pull every identity's contract.
+    // Once the seed and meta are both in, pull every persona's contract.
     use_effect(move || {
         let ready = seed().is_some() && *META_LOADED.read();
         if ready {
@@ -269,11 +370,13 @@ pub fn App() -> Element {
             None => rsx! { Loading { message: "Reaching your key store…" } },
             Some(None) => rsx! { Onboarding {} },
             Some(Some(_)) if !*META_LOADED.read() => {
-                rsx! { Loading { message: "Loading your identities…" } }
+                rsx! { Loading { message: "Loading your personas…" } }
             }
+            Some(Some(_)) if CONNECT.read().is_some() => rsx! { ConnectView {} },
             Some(Some(_)) => match *VIEW.read() {
                 View::Home => rsx! { Home {} },
                 View::Identity(index) => rsx! { Detail { index } },
+                View::Backup => rsx! { BackupView {} },
             },
         }
     };
@@ -291,7 +394,9 @@ pub fn App() -> Element {
         }
         main { {body} }
         footer { class: "foot",
-            "your identity, everywhere · "
+            "your persona, everywhere · "
+            button { onclick: move |_| *VIEW.write() = View::Backup, "backup" }
+            " · "
             a { href: "https://github.com/skandragon/freenet-whoiam", target: "_blank", "source" }
         }
     }
@@ -347,7 +452,7 @@ fn Onboarding() -> Element {
     rsx! {
         section { class: "hero",
             h1 {
-                "One identity. "
+                "One persona. "
                 span { class: "grad", "Every app." }
             }
             p { class: "sub",
@@ -398,7 +503,7 @@ fn Onboarding() -> Element {
                         }
                         button { class: "ghost", onclick: move |_| restoring.set(false), "Back" }
                     }
-                    if *busy.read() { p { class: "muted", "Probing your identity addresses — this takes about ten seconds." } }
+                    if *busy.read() { p { class: "muted", "Probing your persona addresses — this takes about ten seconds." } }
                 }
             }
             if !error.read().is_empty() { p { class: "error", "{error}" } }
@@ -418,7 +523,7 @@ fn Home() -> Element {
             if entries.is_empty() {
                 div { class: "card narrow center-text",
                     h2 { "Your key is ready" }
-                    p { class: "muted", "Create your first identity — a public page other Freenet apps can read your avatar and profile from. You can make more than one; they're not linkable to each other." }
+                    p { class: "muted", "Create your first persona — a public page other Freenet apps can read your avatar and profile from. You can make more than one; they're not linkable to each other." }
                 }
             }
             div { class: "grid",
@@ -426,7 +531,7 @@ fn Home() -> Element {
                     IdentityCard { index: entry.index, label: entry.label.clone() }
                 }
                 div { class: "card new-card",
-                    h3 { "New identity" }
+                    h3 { "New persona" }
                     input {
                         placeholder: "label (only you see this)",
                         value: "{new_label}",
@@ -453,6 +558,133 @@ fn Home() -> Element {
                     if !error.read().is_empty() { p { class: "error", "{error}" } }
                 }
             }
+        }
+    }
+}
+
+/// Bounce-through persona picker: an external site asked who the user is.
+/// Approve signs a connect proof with the chosen persona's key and returns
+/// to the callback (same tab for same-node apps, new tab otherwise);
+/// refuse returns with `whoiam=denied`.
+#[component]
+fn ConnectView() -> Element {
+    let Some(req) = CONNECT.read().clone() else {
+        return rsx! {};
+    };
+    let entries = META.read().identities.clone();
+    let mut sent = use_signal(|| None::<(String, bool)>);
+    let mut error = use_signal(String::new);
+    let origin = req.origin.clone();
+    let deny_req = req.clone();
+
+    if let Some((msg, in_tab)) = sent.read().clone() {
+        let hint = if in_tab { "Taking you back to the site…" } else { "You can close this tab now." };
+        return rsx! {
+            section { class: "wrap narrow-wrap",
+                div { class: "card center-text",
+                    h2 { "{msg}" }
+                    p { class: "muted", "{hint}" }
+                    button { class: "ghost", onclick: move |_| *CONNECT.write() = None, "back to whoiam" }
+                }
+            }
+        };
+    }
+
+    rsx! {
+        section { class: "wrap narrow-wrap",
+            div { class: "card",
+                h2 { "Share a persona?" }
+                p {
+                    strong { "{origin}" }
+                    " wants to know who you are."
+                }
+                p { class: "muted",
+                    "Sharing sends a signed proof that you own the persona. The site learns its public key (and can read its public profile) — nothing else."
+                }
+            }
+            if entries.is_empty() {
+                div { class: "card center-text",
+                    p { class: "muted", "You don't have any personas yet. Set one up first, then start over from the site." }
+                    button { class: "ghost", onclick: move |_| *CONNECT.write() = None, "open whoiam" }
+                }
+            }
+            div { class: "grid",
+                for entry in entries {
+                    ConnectCard {
+                        index: entry.index,
+                        label: entry.label.clone(),
+                        req: req.clone(),
+                        on_done: move |result: Result<(String, bool), String>| match result {
+                            Ok(msg) => sent.set(Some(msg)),
+                            Err(e) => error.set(e),
+                        },
+                    }
+                }
+            }
+            div { class: "row",
+                button { class: "ghost",
+                    onclick: move |_| {
+                        match leave_to(&actions::connect_denied_url(&deny_req)) {
+                            Ok(in_tab) => sent.set(Some(("Declined".into(), in_tab))),
+                            Err(e) => error.set(e),
+                        }
+                    },
+                    "Don't share"
+                }
+            }
+            if !error.read().is_empty() { p { class: "error", "{error}" } }
+        }
+    }
+}
+
+#[component]
+fn ConnectCard(
+    index: u32,
+    label: String,
+    req: ConnectRequest,
+    on_done: EventHandler<Result<(String, bool), String>>,
+) -> Element {
+    let Some(pk) = actions::identity_pubkey(index) else {
+        return rsx! {};
+    };
+    let pkb = pk.to_bytes();
+    let profile = published_profile(index);
+    let avatar = published_avatar(index);
+    let display = profile
+        .as_ref()
+        .map(|p| p.name.clone())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| label.clone());
+
+    rsx! {
+        button { class: "card id-card",
+            onclick: move |_| {
+                // Sign at click time so the timestamp is fresh; the click on
+                // this card IS the consent.
+                let result = actions::connect_ok_url(index, &req, crate::keys::now_ms())
+                    .and_then(|url| leave_to(&url))
+                    .map(|in_tab| (format!("Shared as “{display}”"), in_tab));
+                on_done.call(result);
+            },
+            div { class: "id-head",
+                match avatar {
+                    Some(bytes) => rsx! { img { class: "avatar", src: avatar_data_url(&bytes), alt: "" } },
+                    None => rsx! { span { class: "avatar", style: identicon_style(&pkb) } },
+                }
+                div {
+                    h3 { "{label}" }
+                    code { class: "muted", "{short_key(&pkb)}" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn BackupView() -> Element {
+    rsx! {
+        section { class: "wrap narrow-wrap",
+            button { class: "ghost back", onclick: move |_| *VIEW.write() = View::Home, "← all personas" }
             BackupCard {}
         }
     }
@@ -492,30 +724,40 @@ fn IdentityCard(index: u32, label: String) -> Element {
 
 #[component]
 fn BackupCard() -> Element {
+    // The host page's CSP (frame-src 'self') blocks blob:/data: downloads
+    // from this sandboxed iframe, so a file download is impossible here —
+    // reveal the backup text and let the user copy/save it themselves.
     let mut error = use_signal(String::new);
-    let mut done = use_signal(|| false);
+    let mut revealed = use_signal(|| None::<String>);
     rsx! {
         div { class: "card backup",
             div {
                 h3 { "Back up your master seed" }
                 p { class: "muted",
-                    "One file covers every identity — even ones you create later. Anyone holding it controls them all, so store it somewhere safe."
+                    "One backup covers every persona — even ones you create later. Anyone holding it controls them all, so store it somewhere safe."
                 }
             }
-            div { class: "row",
-                button { class: "primary",
-                    onclick: move |_| {
-                        error.set(String::new());
-                        match actions::backup_text().and_then(|t| download_text("whoiam-seed.txt", &t)) {
-                            Ok(()) => {
-                                done.set(true);
-                                spawn(async move { crate::sleep_ms(3000).await; done.set(false); });
-                            }
-                            Err(e) => error.set(e),
+            match revealed.read().clone() {
+                None => rsx! {
+                    div { class: "row",
+                        button { class: "primary",
+                            onclick: move |_| {
+                                match actions::backup_text() {
+                                    Ok(t) => revealed.set(Some(t)),
+                                    Err(e) => error.set(e),
+                                }
+                            },
+                            "Show backup"
                         }
-                    },
-                    if *done.read() { "Saved ✓" } else { "Download backup" }
-                }
+                    }
+                },
+                Some(text) => rsx! {
+                    textarea { class: "backup-text", readonly: true, rows: 10, value: "{text}" }
+                    div { class: "row",
+                        CopyButton { text: text.clone(), label: "copy".to_string() }
+                        button { class: "ghost", onclick: move |_| revealed.set(None), "hide" }
+                    }
+                },
             }
             if !error.read().is_empty() { p { class: "error", "{error}" } }
         }
@@ -556,6 +798,7 @@ fn Detail(index: u32) -> Element {
         form_seeded.set(true);
     }
 
+    let mut editing = use_signal(|| false);
     let mut save_busy = use_signal(|| false);
     let mut save_msg = use_signal(String::new);
     let mut save_err = use_signal(String::new);
@@ -570,8 +813,8 @@ fn Detail(index: u32) -> Element {
     if !arrived {
         return rsx! {
             section { class: "wrap narrow-wrap",
-                button { class: "ghost back", onclick: move |_| *VIEW.write() = View::Home, "← all identities" }
-                Loading { message: "Fetching this identity from the network…" }
+                button { class: "ghost back", onclick: move |_| *VIEW.write() = View::Home, "← all personas" }
+                Loading { message: "Fetching this persona from the network…" }
             }
         };
     }
@@ -579,9 +822,16 @@ fn Detail(index: u32) -> Element {
     let addr = full_key(&pkb);
     let contract_id = crate::keys::identity_key(&pk).id().to_string();
 
+    let pub_name = profile.as_ref().map(|p| p.name.clone()).unwrap_or_default();
+    let pub_bio = profile.as_ref().map(|p| p.bio.clone()).unwrap_or_default();
+    // save_profile trims before publishing, so compare trimmed.
+    let dirty = name.read().trim() != pub_name || bio.read().trim() != pub_bio;
+    let show_name = if pub_name.is_empty() { "—".to_string() } else { pub_name.clone() };
+    let show_bio = if pub_bio.is_empty() { "—".to_string() } else { pub_bio.clone() };
+
     rsx! {
         section { class: "wrap narrow-wrap",
-            button { class: "ghost back", onclick: move |_| *VIEW.write() = View::Home, "← all identities" }
+            button { class: "ghost back", onclick: move |_| *VIEW.write() = View::Home, "← all personas" }
 
             div { class: "card",
                 div { class: "id-head lg",
@@ -596,8 +846,11 @@ fn Detail(index: u32) -> Element {
                 }
                 p { class: "muted", "Profile picture — auto-cropped square, published as PNG:" }
                 div { class: "row",
+                    // Hidden input; the label below is the visible control.
                     input {
+                        id: "avatar-file",
                         r#type: "file",
+                        style: "display:none",
                         accept: "image/png,image/jpeg,image/webp,image/gif",
                         disabled: *pic_busy.read(),
                         onchange: move |e| {
@@ -615,6 +868,9 @@ fn Detail(index: u32) -> Element {
                                 pic_busy.set(false);
                             });
                         },
+                    }
+                    label { class: "ghost", r#for: "avatar-file",
+                        if avatar.is_some() { "change" } else { "choose file" }
                     }
                     if avatar.is_some() {
                         button { class: "ghost", disabled: *pic_busy.read(),
@@ -635,48 +891,69 @@ fn Detail(index: u32) -> Element {
 
             div { class: "card",
                 h3 { "Public profile" }
-                label { "Name" }
-                input {
-                    value: "{name}",
-                    maxlength: "{MAX_NAME_CHARS}",
-                    placeholder: "shown in apps",
-                    oninput: move |e| name.set(e.value()),
-                }
-                label { "Bio" }
-                textarea {
-                    rows: 3,
-                    value: "{bio}",
-                    maxlength: "{MAX_BIO_CHARS}",
-                    placeholder: "a line about you ({MAX_BIO_CHARS} chars max)",
-                    oninput: move |e| bio.set(e.value()),
-                }
-                div { class: "row",
-                    button { class: "primary", disabled: *save_busy.read(),
-                        onclick: move |_| {
-                            save_busy.set(true);
-                            save_err.set(String::new());
-                            save_msg.set(String::new());
-                            spawn(async move {
-                                match actions::save_profile(index, name.read().clone(), bio.read().clone()).await {
-                                    Ok(()) => {
-                                        save_msg.set("published ✓".into());
-                                        spawn(async move { crate::sleep_ms(2500).await; save_msg.set(String::new()); });
-                                    }
-                                    Err(e) => save_err.set(e),
-                                }
-                                save_busy.set(false);
-                            });
-                        },
-                        if *save_busy.read() { "Publishing…" } else { "Publish" }
+                if *editing.read() {
+                    label { "Name" }
+                    input {
+                        value: "{name}",
+                        maxlength: "{MAX_NAME_CHARS}",
+                        placeholder: "shown in apps",
+                        oninput: move |e| name.set(e.value()),
                     }
-                    if !save_msg.read().is_empty() { span { class: "ok", "{save_msg}" } }
+                    label { "Bio" }
+                    textarea {
+                        rows: 3,
+                        value: "{bio}",
+                        maxlength: "{MAX_BIO_CHARS}",
+                        placeholder: "a line about you ({MAX_BIO_CHARS} chars max)",
+                        oninput: move |e| bio.set(e.value()),
+                    }
+                    div { class: "row",
+                        if dirty {
+                            button { class: "primary", disabled: *save_busy.read(),
+                                onclick: move |_| {
+                                    save_busy.set(true);
+                                    save_err.set(String::new());
+                                    save_msg.set(String::new());
+                                    spawn(async move {
+                                        match actions::save_profile(index, name.read().clone(), bio.read().clone()).await {
+                                            Ok(()) => {
+                                                editing.set(false);
+                                                save_msg.set("published ✓".into());
+                                                spawn(async move { crate::sleep_ms(2500).await; save_msg.set(String::new()); });
+                                            }
+                                            Err(e) => save_err.set(e),
+                                        }
+                                        save_busy.set(false);
+                                    });
+                                },
+                                if *save_busy.read() { "Publishing…" } else { "Publish" }
+                            }
+                        }
+                        button { class: "ghost", disabled: *save_busy.read(),
+                            onclick: move |_| {
+                                name.set(pub_name.clone());
+                                bio.set(pub_bio.clone());
+                                editing.set(false);
+                            },
+                            "cancel"
+                        }
+                    }
+                } else {
+                    label { "Name" }
+                    p { "{show_name}" }
+                    label { "Bio" }
+                    p { "{show_bio}" }
+                    div { class: "row",
+                        button { class: "ghost", onclick: move |_| editing.set(true), "change" }
+                        if !save_msg.read().is_empty() { span { class: "ok", "{save_msg}" } }
+                    }
                 }
                 if !save_err.read().is_empty() { p { class: "error", "{save_err}" } }
             }
 
             div { class: "card",
                 h3 { "Share with apps" }
-                p { class: "muted", "Apps fetch this identity with your public key (they derive the contract from it):" }
+                p { class: "muted", "Apps fetch this persona with your public key (they derive the contract from it):" }
                 label { "Public key" }
                 div { class: "keyrow" ,
                     code { "{addr}" }
@@ -689,10 +966,10 @@ fn Detail(index: u32) -> Element {
                 }
             }
 
-            div { class: "card danger",
-                h3 { "Danger zone" }
+            details { class: "card danger",
+                summary { h3 { "Danger zone" } }
                 p { class: "muted",
-                    "Destroying publishes a signed, permanent “this identity is gone” marker, then forgets the key material. Apps that check will stop showing you. This cannot be undone."
+                    "Destroying publishes a signed, permanent “this persona is gone” marker, then forgets the key material. Apps that check will stop showing you. This cannot be undone."
                 }
                 label { "Type the label (“{entry_label}”) to confirm" }
                 input {
@@ -712,10 +989,11 @@ fn Detail(index: u32) -> Element {
                             destroy_busy.set(false);
                         });
                     },
-                    if *destroy_busy.read() { "Destroying…" } else { "Destroy this identity forever" }
+                    if *destroy_busy.read() { "Destroying…" } else { "Destroy this persona forever" }
                 }
                 if !destroy_err.read().is_empty() { p { class: "error", "{destroy_err}" } }
             }
         }
     }
 }
+

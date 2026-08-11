@@ -24,6 +24,7 @@ everywhere.
 | `delegates/whoiam-delegate/` | seed store delegate (wasm) |
 | `toolkit/whoiam-client/` | Rust consumer crate + `whoiam-fetch` example |
 | `ui/` | Dioxus web UI, published to Freenet as a site contract |
+| `demo/` | connect-flow demo app (verify proof, fetch profile), its own site contract |
 | `e2e/` | Playwright suite (run against a throwaway test node) |
 
 ## Consuming an identity (Rust)
@@ -36,6 +37,12 @@ let id = whoiam_client::fetch(
 ```
 
 Signatures are verified client-side; the serving node is untrusted.
+
+Apps can also ask the user to prove persona ownership ("sign in with
+whoiam"): open the whoiam site with `?connect=v1&challenge=…&return=…`,
+verify the signed callback, then fetch the proven key's contract — see the
+connect-flow section of [docs/resources.md](docs/resources.md) and the
+demo app in [demo/](demo/) (`make publish-demo`).
 
 Or from a shell:
 

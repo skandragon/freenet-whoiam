@@ -2,6 +2,7 @@
 //! resource schemas, delegate API. Pure logic — no wasm entry points, no
 //! I/O — shared by the contract, the delegate, the toolkit, and the UI.
 
+pub mod connect;
 pub mod delegate_api;
 pub mod derive;
 pub mod merge;
