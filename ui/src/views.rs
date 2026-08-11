@@ -268,7 +268,9 @@ pub fn App() -> Element {
     };
 
     rsx! {
-        document::Stylesheet { href: asset!("/assets/main.css") }
+        // Inlined: the site is served under /v1/contract/web/<id>/ with no
+        // server-side routing, so linked asset paths 404 (freebird pattern).
+        style { dangerous_inner_html: include_str!("../assets/main.css") }
         header { class: "top",
             button { class: "wordmark", onclick: move |_| *VIEW.write() = View::Home,
                 span { class: "who", "who" }
