@@ -1,0 +1,63 @@
+[workspace]
+members = [
+    "common",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/skandragon/freenet-whoiam"
+
+[workspace.dependencies]
+ciborium = "0.2.2"
+serde = { version = "1.0", features = ["derive"] }
+# Compact CBOR byte strings for blobs (Vec<u8> alone serializes as an int
+# array, roughly doubling wire size).
+serde_bytes = "0.11"
+
+ed25519-dalek = { version = "2.1.1", default-features = false, features = ["alloc", "serde"] }
+blake3 = "1.5"
+bs58 = "0.5"
+
+# getrandom: NEVER enable a backend feature ("js") at the workspace level.
+# Contract and delegate WASM runs under wasmtime, which cannot resolve
+# wasm-bindgen placeholder imports (see freenet/river#241). The UI declares
+# its own getrandom with features = ["js"]; wasm crates use ["custom"].
+getrandom = { version = "0.2" }
+
+data-encoding = "2"
+
+freenet-stdlib = { version = "0.8.5", features = ["contract"] }
+
+whoiam-core = { path = "common" }
+
+rand = "0.8.5"
+
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.blake3]
+opt-level = 3
+
+[profile.release]
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
+
+[profile.release.package."*"]
+opt-level = 'z'
+
+# Used by `dx build --release` for the UI; contract/delegate build with
+# --profile release so their bytes (and derived addresses) are unaffected.
+[profile.wasm-release]
+inherits = "release"
+opt-level = 'z'
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
