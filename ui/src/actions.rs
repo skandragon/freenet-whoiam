@@ -65,6 +65,19 @@ async fn kv_store_confirmed(key: &str, value: Vec<u8>) -> Result<(), String> {
     .await
 }
 
+/// PUT an empty contract and wait for the node's PutResponse. Same reason
+/// as `kv_store_confirmed`: a resolved `send()` is not an accepted write.
+async fn put_identity_confirmed(pk: &VerifyingKey, what: &str) -> Result<(), String> {
+    let baseline = api::contract_acks(pk);
+    api::put_identity(pk, &IdentityStateV1::default()).await?;
+    wait_until(
+        || api::contract_acks(pk) > baseline,
+        CONTRACT_ACK_TIMEOUT_MS,
+        what,
+    )
+    .await
+}
+
 /// Persist meta, then mirror it locally — only after the delegate confirms,
 /// so the UI never shows identities the store doesn't hold.
 async fn store_meta(meta: &IdentityMeta) -> Result<(), String> {
@@ -179,14 +192,7 @@ pub async fn readd_index(index: u32) -> Result<(), String> {
     if meta.identities.iter().any(|e| e.index == index) {
         return Err(format!("index {index} is already attached"));
     }
-    let baseline = api::contract_acks(&pk);
-    api::put_identity(&pk, &IdentityStateV1::default()).await?;
-    wait_until(
-        || api::contract_acks(&pk) > baseline,
-        CONTRACT_ACK_TIMEOUT_MS,
-        "reviving the identity contract",
-    )
-    .await?;
+    put_identity_confirmed(&pk, "reviving the identity contract").await?;
     meta.identities.push(IdentityEntry {
         index,
         label: format!("identity {index}"),
@@ -205,14 +211,7 @@ pub async fn create_identity(label: String) -> Result<u32, String> {
     let index = meta.alloc_index();
     let sk = signing_key(index)?;
     let pk = sk.verifying_key();
-    let baseline = api::contract_acks(&pk);
-    api::put_identity(&pk, &IdentityStateV1::default()).await?;
-    wait_until(
-        || api::contract_acks(&pk) > baseline,
-        CONTRACT_ACK_TIMEOUT_MS,
-        "creating the identity contract",
-    )
-    .await?;
+    put_identity_confirmed(&pk, "creating the identity contract").await?;
     // Confirmed by the PutResponse — this entry is no longer speculative.
     IDENTITY_STATES
         .write()
@@ -272,7 +271,7 @@ async fn publish_slot(index: u32, name: &str, bytes: Vec<u8>) -> Result<(), Stri
     .await?;
     // Confirmed: mirror locally (idempotent if the echo already merged it).
     let mut states = IDENTITY_STATES.write();
-    let entry = states.entry(pk.to_bytes()).or_insert(None);
+    let entry = states.entry(pkb).or_insert(None);
     let current = entry.get_or_insert_with(IdentityStateV1::default);
     merge_state(current, &delta, &pk, keys::now_ms())?;
     Ok(())

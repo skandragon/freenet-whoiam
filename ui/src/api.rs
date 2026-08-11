@@ -298,10 +298,11 @@ fn dispatch_contract(response: ContractResponse) {
 /// Confirmed writes per contract id: incremented on PutResponse and
 /// UpdateResponse. Uncorrelated with individual requests (the protocol has
 /// no request ids), so waiters compare against a pre-send baseline.
-pub static CONTRACT_ACKS: GlobalSignal<BTreeMap<String, u64>> = Signal::global(BTreeMap::new);
+/// Private: read them through `contract_acks` / `kv_acks`.
+static CONTRACT_ACKS: GlobalSignal<BTreeMap<String, u64>> = Signal::global(BTreeMap::new);
 
 /// Confirmed delegate stores per key, from the delegate's Stored acks.
-pub static KV_ACKS: GlobalSignal<BTreeMap<String, u64>> = Signal::global(BTreeMap::new);
+static KV_ACKS: GlobalSignal<BTreeMap<String, u64>> = Signal::global(BTreeMap::new);
 
 fn bump_contract_ack(key: &ContractKey) {
     *CONTRACT_ACKS.write().entry(key.id().to_string()).or_insert(0) += 1;
@@ -360,7 +361,7 @@ fn dispatch_kv(payload: &[u8]) {
             if key == KEY_SEED {
                 match value.as_deref() {
                     None => *SEED_LOADED.write() = Some(None),
-                    Some(v) => match <[u8; 32]>::try_from(v.as_ref() as &[u8]) {
+                    Some(v) => match <[u8; 32]>::try_from(&v[..]) {
                         Ok(seed) => *SEED_LOADED.write() = Some(Some(seed)),
                         Err(_) => {
                             log("stored seed has wrong length — refusing to treat as absent");

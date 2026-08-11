@@ -38,14 +38,6 @@ fn published(index: u32) -> Option<whoiam_core::state::IdentityStateV1> {
     IDENTITY_STATES.read().get(&pk.to_bytes())?.clone()
 }
 
-/// Whether the identity's state has actually ARRIVED (vs requested/pending).
-/// "No profile yet" and "state not here yet" must not be conflated: seeding
-/// the edit form from a pending state would let Publish LWW-overwrite the
-/// real profile with blanks.
-fn state_arrived(index: u32) -> bool {
-    published(index).is_some()
-}
-
 fn published_profile(index: u32) -> Option<ProfileV1> {
     let state = published(index)?;
     let slot = state.slots.get(SLOT_PROFILE)?;
@@ -62,9 +54,8 @@ fn published_avatar(index: u32) -> Option<Vec<u8>> {
         return None;
     }
     // Signed ≠ well-formed: schema-check before the bytes reach an <img>.
-    whoiam_core::resources::check_avatar_bytes(&slot.bytes)
-        .ok()
-        .map(|_| slot.bytes.clone())
+    whoiam_core::resources::check_avatar_bytes(&slot.bytes).ok()?;
+    Some(slot.bytes.clone())
 }
 
 fn avatar_data_url(bytes: &[u8]) -> String {
@@ -545,7 +536,10 @@ fn Detail(index: u32) -> Element {
         .map(|e| e.label.clone())
         .unwrap_or_default();
 
-    let arrived = state_arrived(index);
+    // Has the state ARRIVED (vs requested/pending)? "No profile yet" and
+    // "state not here yet" must not be conflated: seeding the edit form from
+    // a pending state would let Publish LWW-overwrite the real profile.
+    let arrived = published(index).is_some();
     let profile = published_profile(index);
     let avatar = published_avatar(index);
 
