@@ -643,6 +643,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "identity-contract"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "ed25519-dalek",
+ "freenet-stdlib",
+ "getrandom",
+ "rand",
+ "serde",
+ "whoiam-core",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1371,6 +1384,19 @@ dependencies = [
  "rand",
  "serde",
  "serde_bytes",
+]
+
+[[package]]
+name = "whoiam-delegate"
+version = "0.1.0"
+dependencies = [
+ "bs58",
+ "ciborium",
+ "freenet-stdlib",
+ "getrandom",
+ "serde",
+ "serde_bytes",
+ "whoiam-core",
 ]
 
 [[package]]

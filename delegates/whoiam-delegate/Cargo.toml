@@ -1,0 +1,25 @@
+[package]
+name = "whoiam-delegate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "whoiam key-store delegate: origin-isolated encrypted KV"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+
+[dependencies]
+ciborium.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+bs58.workspace = true
+freenet-stdlib.workspace = true
+whoiam-core.workspace = true
+# Stub getrandom backend (freenet/river#241). No RNG is ever called — key
+# GENERATION happens in the browser UI; this delegate only stores.
+getrandom = { workspace = true, features = ["custom"] }

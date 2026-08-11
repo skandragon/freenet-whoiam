@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "common",
+    "contracts/identity-contract",
+    "delegates/whoiam-delegate",
 ]
 resolver = "2"
 
